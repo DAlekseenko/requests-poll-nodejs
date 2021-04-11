@@ -4,6 +4,7 @@ const http = require("http");
 
 const HOST = '127.0.0.1'
 const PORT = '8080'
+const PROTOCOL = 'http://'
 
 let requests = [
     {
@@ -11,194 +12,172 @@ let requests = [
         url: "/get-user", // url
         method: "GET", // HTTP метод
         important: true,
-        params: [
-            "id",
-        ]
+        params: {
+            id: "id"
+        }
     },
     {
         name: "getAddressCoordinate",
         url: "/get-address-coordinate",
         method: "POST",
         important: false,
-        params: [
-            "getUser.id", // уникальный_идентификатор_запроса.название_поля
-            "getUser.name", // уникальный_идентификатор_запроса.название_поля
-        ]
+        params: {
+            id: "getUser.id", // уникальный_идентификатор_запроса.название_поля
+            name: "getUser.name", // уникальный_идентификатор_запроса.название_поля
+        }
     },
     {
         name: "getUsersFriend",
         url: "/get-users-friend",
         method: "POST",
         important: true,
-        params: [
-            "id",
-        ]
+        params: {
+            id: "id"
+        }
     },
     {
         name: "getBestFriend",
         url: "/get-best-friend",
         method: "GET",
         important: false,
-        params: [
-            "getUsersFriend.bestfriend_id"
-        ]
+        params: {
+            id: "getUsersFriend.bestfriend_id"
+        }
     }
 ]
 
-requests = requests.reduce((acc, cur) => {
-    if (!http.METHODS.includes(cur.method)) {
-        throw Error("incorrect http method")
-    }
-    const dependencies = cur.params.reduce((acc, cur) => {
-        if (!cur) {
+const [, , id] = process.argv // entrance
+
+const entryParams = {
+    id
+}
+
+
+function prepareRequest(listOfHttpMethods) {
+    listOfHttpMethods = requests.reduce((acc, request) => {
+
+        if (!http.METHODS.includes(request.method)) {
+            throw Error("incorrect http method")
+        }
+        const dependencies = Object.values(request.params).reduce((acc, cur) => {
+            const [method, key] = cur.split('.')
+            if (key && method) {
+                acc.add(method)
+            }
             return acc
-        }
-        const [method, key] = cur.split('.')
-        if (key && method) {
-            acc.add(method)
-        }
+        }, new Set())
+        acc.set(request.name, {dependencies, request})
         return acc
-    }, new Set())
 
-    acc.set(cur.name, {dependencies, request: cur})
-    return acc
-}, new Map())
+    }, new Map())
 
+    listOfHttpMethods.forEach(item => {
 
-requests.forEach(request => {
-    if (request.params) {
-        request.dependencies.forEach(method => {
-            if (!requests.has(method)) {
-                throw Error("method for dependency not found")
+        item.dependencies.forEach(method => {
+            if (!listOfHttpMethods.has(method)) {
+                throw Error(`method ${method} for dependency not found`)
+            }
+            if (listOfHttpMethods.get(method).dependencies.has(item.request.name)) {
+                throw Error(`method ${method} has circular dependency on ${item.request.name}`)
             }
         })
+
+    })
+    return listOfHttpMethods;
+}
+
+const executeRequest = (toExecute, callback) => {
+
+    const {method, url, important, params} = toExecute
+
+    const options = {
+        url: `${PROTOCOL}${HOST}:${PORT}${url}`,
+        method,
+        json: true,
     }
-})
+
+    if (method === "POST") {
+        options.body = params
+    }
+    if (method === "GET") {
+        options.qs = params
+    }
+
+    request(options, (error, response, body) => {
+
+        if (!error && response.statusCode !== 200) {
+            error = http.STATUS_CODES[response.statusCode]
+        }
+        if (error) {
+            callback(important ? error : null, null)
+            return
+        }
+        callback(null, body)
+    })
+}
 
 
-const [, , id] = process.argv
+const callback = (request) => (callback) => {
+    const toExecute = {...request}
+    for (let k in toExecute.params) {
+        if (entryParams[k]) {
+            toExecute.params[k] = entryParams[k]
+        }
+    }
+    executeRequest(toExecute, callback);
+}
 
-async.auto({
-    getUser: function (callback) {
+const callbackWithDependencies = (request) => (results, callback) => {
+    const toExecute = {...request}
 
-        const {method, url, important} = requests.get('getUser').request
-
-        const requestUrl = `http://${HOST}:${PORT}${url}/${id}`
-
-        request({
-            url: requestUrl,
-            method,
-            json: true,
-        }, function (error, response, body) {
-
-            if (!error && response.statusCode !== 200) {
-                error = http.STATUS_CODES[response.statusCode]
+    for (let k in request.params) {
+        const [method, key] = request.params[k].split('.')
+        if (!results[method][key]) {
+            if (request.important) {
+                callback(`Param ${key} for ${request.name} not found in response`, null)
+            } else {
+                callback(null, null)
             }
+            return
+        }
+        request.params[k] = results[method][key]
+    }
 
-            if (error) {
-                callback(important ? error : null, null)
+    executeRequest(toExecute, callback);
+}
+
+function generateTasks(listOfHttpMethods) {
+
+    const requests = prepareRequest(listOfHttpMethods)
+    const tasks = {}
+
+    requests.forEach(item => {
+        if (!!item.dependencies.size) {
+            tasks[item.request.name] = [...item.dependencies, callbackWithDependencies(item.request)]
+        } else {
+            tasks[item.request.name] = callback(item.request)
+        }
+
+    })
+
+    return tasks;
+}
+
+function runRequest(tasks) {
+    return new Promise((resolve, reject) => {
+        async.auto(tasks, function (err, results) {
+            if (err) {
+                reject(err)
                 return
             }
-
-            if (!body.id || !body.name) {
-                callback('method getUser, invalid response', null)
-            }
-
-            callback(null, body)
-        });
-    },
-    getAddressCoordinate: ['getUser', function (results, callback) {
-        const {method, url, important} = requests.get('getAddressCoordinate').request
-        const {name, id} = results.getUser
-        const body = {id, name}
-
-
-        const requestUrl = `http://${HOST}:${PORT}${url}`
-
-        request({
-            url: requestUrl,
-            method,
-            json: true,
-            body
-        }, function (error, response, body) {
-
-            if (!error && response.statusCode !== 200) {
-                error = http.STATUS_CODES[response.statusCode]
-            }
-
-            if (error) {
-                callback(important ? error : null, null)
-                return
-            }
-
-            callback(null, body)
-        });
-    }],
-    getUsersFriend: function (callback) {
-        const {method, url, important} = requests.get('getUsersFriend').request
-        const body = {id}
-
-        const requestUrl = `http://${HOST}:${PORT}${url}`
-
-        request({
-            url: requestUrl,
-            method,
-            json: true,
-            body
-        }, function (error, response, body) {
-
-            if (!error && response.statusCode !== 200) {
-                error = http.STATUS_CODES[response.statusCode]
-            }
-
-            if (error) {
-                callback(important ? error : null, null)
-                return
-            }
-
-            if (!body.bestfriend_id) {
-                callback('method getUsersFriend, invalid response', null)
-            }
-
-            callback(null, body)
-        });
-    },
-    getBestFriend: ['getUsersFriend', function (results, callback) {
-
-        console.log('getBestFriend', results)
-
-        const {method, url, important} = requests.get('getBestFriend').request
-
-        const {bestfriend_id} = results.getUsersFriend
-
-        const requestUrl = `http://${HOST}:${PORT}${url}/${bestfriend_id}`
-
-        request({
-            url: requestUrl,
-            method,
-            json: true,
-        }, function (error, response, body) {
-
-            if (!error && response.statusCode !== 200) {
-                error = http.STATUS_CODES[response.statusCode]
-            }
-
-            if (error) {
-                callback(important ? error : null, null)
-                return
-            }
-
-            callback(null, body)
+            resolve(results);
         })
+    })
+}
 
-    }]
-}, function (err, results) {
-    console.log('error = ', err);
-    if(err){
-        console.log('error = ', err);
-        return
-    }
-    console.log('results = ', results);
-    return results;
-})
+const tasks = generateTasks(requests)
+
+runRequest(tasks)
+    .then(console.dir)
+    .catch(console.error)
 
