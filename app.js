@@ -53,7 +53,12 @@ const entryParams = {
 }
 
 
+
 function prepareRequest(listOfHttpMethods) {
+    const numTasks = listOfHttpMethods.length;
+    if(!numTasks) {
+        throw Error("method list is Empty")
+    }
     listOfHttpMethods = requests.reduce((acc, request) => {
 
         if (!http.METHODS.includes(request.method)) {
@@ -71,18 +76,53 @@ function prepareRequest(listOfHttpMethods) {
 
     }, new Map())
 
+
+    const uncheckedDependencies = {}
+    const readyToCheck = []
     listOfHttpMethods.forEach(item => {
 
         item.dependencies.forEach(method => {
             if (!listOfHttpMethods.has(method)) {
                 throw Error(`method ${method} for dependency not found`)
             }
-            if (listOfHttpMethods.get(method).dependencies.has(item.request.name)) {
-                throw Error(`method ${method} has circular dependency on ${item.request.name}`)
-            }
         })
-
+        if(!item.dependencies.size) {
+            readyToCheck.push(item.request.name);
+        }
+        uncheckedDependencies[item.request.name] = item.dependencies.size;
     })
+
+    function checkForDeadlocks() {
+        let currentTask;
+        let counter = 0;
+        while (readyToCheck.length) {
+            currentTask = readyToCheck.pop();
+            counter++;
+            getDependents(currentTask).forEach(dependent => {
+                if (--uncheckedDependencies[dependent] === 0) {
+                    readyToCheck.push(dependent);
+                }
+            });
+        }
+        if (counter !== numTasks) {
+            throw new Error(
+                'failed validate tasks due to a recursive dependency'
+            );
+        }
+    }
+
+    function getDependents(taskName) {
+        const result = [];
+
+        listOfHttpMethods.forEach(({dependencies, request}) => {
+            if (dependencies.has(taskName)) {
+                result.push(request.name);
+            }
+        });
+        return result;
+    }
+    checkForDeadlocks()
+
     return listOfHttpMethods;
 }
 
@@ -132,7 +172,8 @@ const callbackWithDependencies = (request) => (results, callback) => {
 
     for (let k in request.params) {
         const [method, key] = request.params[k].split('.')
-        if (!results[method][key]) {
+        console.warn(method, key, results)
+        if (!results[method] || !results[method][key]) {
             if (request.important) {
                 callback(`Param ${key} for ${request.name} not found in response`, null)
             } else {
@@ -164,15 +205,7 @@ function generateTasks(listOfHttpMethods) {
 }
 
 function runRequest(tasks) {
-    return new Promise((resolve, reject) => {
-        async.auto(tasks, function (err, results) {
-            if (err) {
-                reject(err)
-                return
-            }
-            resolve(results);
-        })
-    })
+    return async.auto(tasks)
 }
 
 const tasks = generateTasks(requests)
